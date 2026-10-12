@@ -8,6 +8,7 @@ const { createClient } = require('@vercel/kv')
 const { promisify } = require('util')
 const { Sema } = require('async-sema')
 const { spawn, exec: execOrig } = require('child_process')
+const treeKill = require('tree-kill')
 const { createNextInstall } = require('./test/lib/create-next-install')
 const { getBrowserLaunch } = require('./test/lib/browsers/launch')
 const glob = promisify(_glob)
@@ -154,6 +155,45 @@ class TestProfile {
   }
 }
 
+// Hard timeout for a single attempt of a test file. Jest's own timeouts can't
+// fire when a test blocks the event loop (or when teardown hangs), so without
+// this a stuck suite runs until the CI job is killed and its buffered output
+// is lost. The slowest suites currently take ~11 minutes.
+const DEFAULT_SUITE_TIMEOUT_MINUTES = 15
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+/**
+ * Resolves the per-attempt suite timeout. CLI flag takes precedence over the
+ * env var. `0` disables the timeout; empty values fall back to the default and
+ * invalid values warn and fall back to the default.
+ *
+ * @param {string | undefined} cliValue
+ * @param {string | undefined} envValue
+ * @returns {number} timeout in milliseconds, or 0 when disabled
+ */
+function resolveSuiteTimeoutMs(cliValue, envValue) {
+  for (const [source, value] of [
+    ['--suite-timeout', cliValue],
+    ['NEXT_TEST_SUITE_TIMEOUT_MINUTES', envValue],
+  ]) {
+    if (value === undefined || value.trim() === '') continue
+    const minutes = Number(value)
+    const timeoutMs = minutes * 60 * 1000
+    if (
+      !Number.isFinite(minutes) ||
+      minutes < 0 ||
+      timeoutMs > MAX_TIMER_DELAY_MS
+    ) {
+      console.warn(
+        `Invalid ${source} value ${JSON.stringify(value)}, using default of ${DEFAULT_SUITE_TIMEOUT_MINUTES} minutes`
+      )
+      break
+    }
+    return timeoutMs
+  }
+  return DEFAULT_SUITE_TIMEOUT_MINUTES * 60 * 1000
+}
+
 // Do not rename or format. sync-react script relies on this line.
 // prettier-ignore
 const nextjsReactPeerVersion = "19.3.0";
@@ -164,6 +204,11 @@ let argv = require('yargs/yargs')(process.argv.slice(2))
   .boolean('timings')
   .boolean('write-timings')
   .number('retries')
+  .string('suite-timeout')
+  .describe(
+    'suite-timeout',
+    `Hard timeout in minutes for each attempt of a test file (default ${DEFAULT_SUITE_TIMEOUT_MINUTES}, 0 disables). Also configurable via NEXT_TEST_SUITE_TIMEOUT_MINUTES`
+  )
   .boolean('debug')
   .string('g')
   .alias('g', 'group')
@@ -417,6 +462,10 @@ async function main() {
     dry: argv.dry ?? false,
     local: argv.local ?? false,
     printTests: argv.printTests ?? false,
+    suiteTimeoutMs: resolveSuiteTimeoutMs(
+      /** @type {string | undefined} */ (argv.suiteTimeout),
+      process.env.NEXT_TEST_SUITE_TIMEOUT_MINUTES
+    ),
   }
   let numRetries = options.retries
   const hideOutput = !options.debug && !options.dry
@@ -823,41 +872,99 @@ ${ENDGROUP}`)
 
       children.add(child)
 
-      child.on('exit', async (code, signal) => {
+      let timedOut = false
+      let settled = false
+      /** @type {Promise<void>} */
+      let killDone = Promise.resolve()
+      const printFailureOutput = async () => {
+        if (!hideOutput) return
+        await outputSema.acquire()
+        const isExpanded = firstError
+        if (isExpanded) {
+          firstError = false
+          process.stdout.write(`❌ ${test.file} output:\n`)
+        } else {
+          process.stdout.write(`${GROUP}❌ ${test.file} output\n`)
+        }
+
+        let output = ''
+        // limit out to last 64kb so that we don't
+        // run out of log room in CI
+        for (const { chunk } of outputChunks) {
+          process.stdout.write(chunk)
+          output += chunk.toString()
+        }
+
+        if (process.env.CI) {
+          errorsPerTests.set(test.file, { output, failedCases: [] })
+        }
+
+        if (isExpanded) {
+          process.stdout.write(`end of ${test.file} output\n`)
+        } else {
+          process.stdout.write(`end of ${test.file} output\n${ENDGROUP}\n`)
+        }
+        outputSema.release()
+      }
+      /** @param {Error} err */
+      const failAttempt = async (err) => {
+        if (settled) return
+        settled = true
+        clearTimeout(suiteTimeout)
         children.delete(child)
-        const isChildExitWithNonZero = code !== 0 || signal !== null
+        await printFailureOutput()
+        // @ts-expect-error
+        err.output = outputChunks.map(({ chunk }) => chunk.toString()).join('')
+        reject(err)
+      }
+      child.once('error', failAttempt)
+      const suiteTimeout =
+        options.suiteTimeoutMs > 0
+          ? setTimeout(() => {
+              timedOut = true
+              const message = `${test.file} timed out after ${
+                options.suiteTimeoutMs / 60_000
+              } minutes, killing`
+              console.error(message)
+              stdout(`\n${message}\n`)
+              if (child.pid === undefined) {
+                failAttempt(new Error(message))
+                return
+              }
+              // Kill the whole tree: jest plus any next-server, browser or
+              // package manager processes it spawned.
+              killDone = new Promise((resolveKill) => {
+                treeKill(child.pid, 'SIGKILL', (err) => {
+                  if (err) {
+                    const killError = `Failed to kill ${test.file}: ${err.message}`
+                    console.error(killError)
+                    stdout(`${killError}\n`)
+                    failAttempt(new Error(`${message}; ${killError}`))
+                  }
+                  resolveKill()
+                })
+              })
+            }, options.suiteTimeoutMs)
+          : undefined
+
+      child.on('exit', async (code, signal) => {
+        if (settled) return
+        // After a timeout, wait until the whole process tree is killed before
+        // reporting the attempt (and possibly retrying).
+        if (timedOut) await killDone
+        if (settled) return
+        settled = true
+        clearTimeout(suiteTimeout)
+        children.delete(child)
+        const isChildExitWithNonZero = code !== 0 || signal !== null || timedOut
         if (isChildExitWithNonZero) {
-          if (hideOutput) {
-            await outputSema.acquire()
-            const isExpanded = firstError
-            if (isExpanded) {
-              firstError = false
-              process.stdout.write(`❌ ${test.file} output:\n`)
-            } else {
-              process.stdout.write(`${GROUP}❌ ${test.file} output\n`)
-            }
-
-            let output = ''
-            // limit out to last 64kb so that we don't
-            // run out of log room in CI
-            for (const { chunk } of outputChunks) {
-              process.stdout.write(chunk)
-              output += chunk.toString()
-            }
-
-            if (process.env.CI) {
-              errorsPerTests.set(test.file, { output, failedCases: [] })
-            }
-
-            if (isExpanded) {
-              process.stdout.write(`end of ${test.file} output\n`)
-            } else {
-              process.stdout.write(`end of ${test.file} output\n${ENDGROUP}\n`)
-            }
-            outputSema.release()
-          }
+          await printFailureOutput()
           const err = new Error(
-            code ? `failed with code: ${code}` : `failed with signal: ${signal}`
+            timedOut
+              ? `timed out after ${options.suiteTimeoutMs / 60_000} minutes`
+              : code
+                ? `failed with code: ${code}`
+                : `failed with signal: ${signal}`
           )
           // @ts-expect-error
           err.output = outputChunks
